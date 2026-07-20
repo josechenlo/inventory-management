@@ -1,8 +1,10 @@
+import random
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
-from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
+from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders, restock_orders
 
 app = FastAPI(title="Factory Inventory Management System")
 
@@ -45,6 +47,92 @@ def apply_filters(items: list, warehouse: Optional[str] = None, category: Option
         filtered = [item for item in filtered if item.get('status', '').lower() == status.lower()]
 
     return filtered
+
+def _score_restock_candidates() -> list:
+    """Join demand forecasts to inventory by SKU and rank restock candidates.
+
+    Priority weights urgency (60%) over demand growth (40%) since an item
+    already near/below its reorder point is a bigger operational risk than
+    one that is merely trending up. Items with healthy stock and no growth
+    score 0 and are excluded so they never get recommended.
+    """
+    candidates = []
+    inventory_by_sku = {item["sku"]: item for item in inventory_items}
+
+    for forecast in demand_forecasts:
+        inv = inventory_by_sku.get(forecast["item_sku"])
+        if inv is None:
+            continue
+
+        reorder_point = inv["reorder_point"]
+        qty_on_hand = inv["quantity_on_hand"]
+        near_reorder_threshold = reorder_point * 1.2
+
+        if qty_on_hand >= near_reorder_threshold:
+            urgency_score = 0.0
+        else:
+            urgency_score = min((near_reorder_threshold - qty_on_hand) / near_reorder_threshold, 1.0)
+
+        current_demand = forecast["current_demand"] or 1
+        growth_rate = (forecast["forecasted_demand"] - current_demand) / current_demand
+        growth_score = max(min(growth_rate, 1.0), 0.0)
+
+        priority_score = round(0.6 * urgency_score + 0.4 * growth_score, 4)
+
+        target_stock = max(reorder_point, forecast["forecasted_demand"])
+        recommended_quantity = max(target_stock - qty_on_hand, 0)
+
+        if recommended_quantity == 0 or priority_score == 0:
+            continue
+
+        candidates.append({
+            "sku": forecast["item_sku"],
+            "item_name": forecast["item_name"],
+            "category": inv["category"],
+            "warehouse": inv["warehouse"],
+            "current_demand": forecast["current_demand"],
+            "forecasted_demand": forecast["forecasted_demand"],
+            "trend": forecast["trend"],
+            "quantity_on_hand": qty_on_hand,
+            "reorder_point": reorder_point,
+            "unit_cost": inv["unit_cost"],
+            "recommended_quantity": recommended_quantity,
+            "priority_score": priority_score
+        })
+
+    # Tie-break by SKU so demo ordering is stable across identical scores
+    candidates.sort(key=lambda c: (-c["priority_score"], c["sku"]))
+    return candidates
+
+def _greedy_fill_budget(candidates: list, budget: float) -> tuple:
+    """Buy as much of each candidate's recommended quantity as the budget allows.
+
+    Walks candidates highest priority first; if the top item is too
+    expensive to afford even one unit, moves on to the next (cheaper)
+    candidate rather than stopping outright. This is an intentional
+    simplification, not a full budget-optimal knapsack solve.
+    """
+    remaining_budget = budget
+    selected = []
+
+    for candidate in candidates:
+        if remaining_budget <= 0:
+            break
+
+        unit_cost = candidate["unit_cost"]
+        affordable_qty = int(remaining_budget // unit_cost)
+        quantity = min(candidate["recommended_quantity"], affordable_qty)
+
+        if quantity <= 0:
+            continue
+
+        line_cost = round(quantity * unit_cost, 2)
+        remaining_budget -= line_cost
+
+        selected.append({**candidate, "recommended_quantity": quantity, "line_cost": line_cost})
+
+    total_cost = round(sum(item["line_cost"] for item in selected), 2)
+    return selected, total_cost
 
 # CORS middleware
 app.add_middleware(
@@ -120,6 +208,49 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class RestockRecommendationItem(BaseModel):
+    sku: str
+    item_name: str
+    category: str
+    warehouse: str
+    current_demand: int
+    forecasted_demand: int
+    trend: str
+    quantity_on_hand: int
+    reorder_point: int
+    unit_cost: float
+    recommended_quantity: int
+    line_cost: float
+    priority_score: float
+
+class RestockRecommendationsResponse(BaseModel):
+    budget: float
+    total_cost: float
+    remaining_budget: float
+    items: List[RestockRecommendationItem]
+
+class RestockOrderItem(BaseModel):
+    sku: str
+    item_name: str
+    quantity: int
+    unit_cost: float
+    line_cost: float
+
+class CreateRestockOrderRequest(BaseModel):
+    budget: float
+    items: List[RestockOrderItem]
+
+class RestockOrder(BaseModel):
+    id: str
+    order_number: str
+    budget: float
+    items: List[RestockOrderItem]
+    total_cost: float
+    status: str
+    order_date: str
+    expected_delivery: str
+    lead_time_days: int
+
 # API endpoints
 @app.get("/")
 def root():
@@ -178,6 +309,56 @@ def get_backlog():
         item_dict["has_purchase_order"] = has_po
         result.append(item_dict)
     return result
+
+@app.get("/api/restocking/recommendations", response_model=RestockRecommendationsResponse)
+def get_restock_recommendations(budget: float = 0):
+    """Recommend items to restock within a given budget.
+
+    Scores demand-forecast items by urgency and demand growth, then
+    greedily fills the budget starting from the highest-priority item.
+    """
+    candidates = _score_restock_candidates()
+    selected, total_cost = _greedy_fill_budget(candidates, budget)
+    return {
+        "budget": budget,
+        "total_cost": total_cost,
+        "remaining_budget": round(budget - total_cost, 2),
+        "items": selected
+    }
+
+@app.post("/api/restock-orders", response_model=RestockOrder, status_code=201)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Submit a multi-item restock order built from the recommendations"""
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Cannot submit an empty restock order")
+
+    total_cost = round(sum(item.line_cost for item in request.items), 2)
+    order_date = datetime.now()
+
+    # Lead time reuses the same random 7-14 day delivery window pattern
+    # generate_data.py uses for customer orders; no supplier lead-time
+    # data exists to look this up from instead.
+    lead_time_days = random.randint(7, 14)
+    expected_delivery = order_date + timedelta(days=lead_time_days)
+
+    new_order = {
+        "id": str(len(restock_orders) + 1),
+        "order_number": f"RSK-{order_date.year}-{len(restock_orders) + 1:04d}",
+        "budget": request.budget,
+        "items": [item.model_dump() for item in request.items],
+        "total_cost": total_cost,
+        "status": "Processing",
+        "order_date": order_date.strftime("%Y-%m-%dT%H:%M:%S"),
+        "expected_delivery": expected_delivery.strftime("%Y-%m-%dT%H:%M:%S"),
+        "lead_time_days": lead_time_days
+    }
+    restock_orders.append(new_order)
+    return new_order
+
+@app.get("/api/restock-orders", response_model=List[RestockOrder])
+def get_restock_orders():
+    """Get all submitted restock orders"""
+    return restock_orders
 
 @app.get("/api/dashboard/summary")
 def get_dashboard_summary(
