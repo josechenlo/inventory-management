@@ -1,0 +1,37 @@
+{
+  "features": [
+    {
+      "id": "F001",
+      "name": "Add CSV export button to inventory page",
+      "description": "Add a CSV export button to the inventory page that exports the currently filtered inventory items",
+      "status": "verified",
+      "passes": true,
+      "subtasks": [
+        {
+          "name": "Add export button to card header",
+          "status": "completed"
+        },
+        {
+          "name": "Implement CSV export function",
+          "status": "completed"
+        },
+        {
+          "name": "Test export with various filters",
+          "status": "completed"
+        },
+        {
+          "name": "Verify file download and content",
+          "status": "completed"
+        }
+      ],
+      "acceptanceCriteria": [
+        "Export button visible in inventory page header",
+        "Button exports currently filtered items",
+        "CSV includes all inventory columns (SKU, Name, Category, Qty, Reorder Point, Unit Cost, Total Value, Location, Status)",
+        "Exported filename includes timestamp",
+        "File downloads without errors"
+      ],
+      "verifiedAt": "2026-07-20T14:55:00Z"
+    }
+  ]
+}
